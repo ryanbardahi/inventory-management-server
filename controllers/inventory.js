@@ -120,3 +120,129 @@ module.exports.searchInventory = async function (req, res) {
         return res.status(500).json({ error: 'Failed to search inventory' });
     }
 };
+
+module.exports.issueInventory = async function (req, res) {
+    try {
+        const {
+            itemCode,
+            issuanceQty,
+            issuedBy,
+            activity,
+            notes,
+            location
+        } = req.body;
+
+        if (!itemCode || !issuanceQty || !issuedBy || !activity || !location) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        // Fetch all inventory
+        const inventoryResponse = await req.sheetsClient.spreadsheets.values.get({
+            spreadsheetId: req.sheetId,
+            range: 'Inventory!A:J'
+        });
+
+        const rows = inventoryResponse.data.values;
+        if (!rows || rows.length < 2) {
+            return res.status(404).json({ error: 'No inventory data found' });
+        }
+
+        const headers = rows[0];
+        const dataRows = rows.slice(1);
+
+        // Identify which columns are which
+        const colLocation = headers.indexOf('Location');
+        const colItemCode = headers.indexOf('Item Code');
+        const colDescription = headers.indexOf('Description');
+        const colQty = headers.indexOf('Qty');
+        const colReturnable = headers.indexOf('Returnable Item');
+
+        if (
+            colLocation === -1 || colItemCode === -1 ||
+            colDescription === -1 || colQty === -1 || colReturnable === -1
+        ) {
+            return res.status(500).json({ error: 'Inventory sheet headers missing required columns' });
+        }
+
+        let targetRowIndex = -1;
+        let currentQty = 0;
+        let description = '';
+        let returnableItem = '';
+
+        for (let i = 0; i < dataRows.length; i++) {
+            const row = dataRows[i];
+            if (row[colItemCode] === itemCode && row[colLocation] === location) {
+                currentQty = parseFloat(row[colQty]) || 0;
+                description = row[colDescription] || '';
+                returnableItem = row[colReturnable] || '';
+                targetRowIndex = i + 1;
+                break;
+            }
+        }
+
+        if (targetRowIndex === -1) {
+            return res.status(404).json({ error: 'Item not found in inventory for the specified location' });
+        }
+
+        const requestQty = parseFloat(issuanceQty);
+        if (isNaN(requestQty) || requestQty <= 0) {
+            return res.status(400).json({ error: 'Invalid issuance quantity' });
+        }
+
+        if (currentQty < requestQty) {
+            return res.status(400).json({ error: 'Not enough quantity in inventory to fulfill issuance' });
+        }
+
+        const newQty = currentQty - requestQty;
+
+        const timestamp = new Date().toISOString();
+
+        const formValues = [[
+            timestamp,
+            itemCode,
+            requestQty,
+            location,
+            description,
+            returnableItem,
+            issuedBy,
+            activity,
+            notes || ''
+        ]];
+
+        await req.sheetsClient.spreadsheets.values.append({
+            spreadsheetId: req.sheetId,
+            range: 'Form Responses!A:I',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: formValues }
+        });
+
+        const inventoryRowNumber = targetRowIndex + 1; 
+        const qtyColumnLetter = String.fromCharCode('A'.charCodeAt(0) + colQty);
+
+        const updateRange = `Inventory!${qtyColumnLetter}${inventoryRowNumber}`;
+        await req.sheetsClient.spreadsheets.values.update({
+            spreadsheetId: req.sheetId,
+            range: updateRange,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[newQty]] }
+        });
+
+        return res.status(200).json({
+            message: 'Inventory issued successfully',
+            data: {
+                Timestamp: timestamp,
+                'Item Code': itemCode,
+                'Issuance Qty': requestQty,
+                Location: location,
+                Description: description,
+                'Returnable Item': returnableItem,
+                'Issued by': issuedBy,
+                Activity: activity,
+                'Notes/Comments': notes || ''
+            }
+        });
+    } catch (err) {
+        console.error('Error issuing inventory:', err);
+        return res.status(500).json({ error: 'Failed to issue inventory' });
+    }
+};
